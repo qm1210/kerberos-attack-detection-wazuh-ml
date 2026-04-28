@@ -1,710 +1,444 @@
-# Phát hiện tấn công Kerberos bằng XGBoost
+# Hệ thống phát hiện tấn công Kerberos sử dụng Machine Learning
 
-Hệ thống dựa trên Machine Learning để phát hiện các tấn công Kerberos (Kerberoasting & AS-REP Roasting) từ nhật ký Event của Windows theo thời gian thực.
+## 📌 Tổng quan dự án
 
-## 📋 Mục lục
+Hệ thống phát hiện tấn công Kerberos được xây dựng dựa trên việc kết hợp **SIEM (Wazuh)** và **mô hình học máy (XGBoost)** để phân loại các sự kiện Kerberos thành ba lớp:
+- **Normal**: Hành vi bình thường
+- **Kerberoasting**: Tấn công kerberoasting
+- **AS-REP Roasting**: Tấn công AS-REP roasting
 
-- [Tổng quan](#-tổng-quan-phương-pháp)
-- [Cài đặt](#-cài-đặt)
-- [Sử dụng](#-sử-dụng)
-- [Kiến trúc](#-kiến-trúc-hệ-thống)
-- [Tùy chỉnh](#-tùy-chỉnh)
+**Đặc điểm chính**:
+- Phát hiện **gần thời gian thực** (real-time detection)
+- Kết hợp **phân loại từng log** (mô hình ML) + **phát hiện hành vi theo chuỗi sự kiện** (behavioral detection)
+- Hoạt động **độc lập với rule-based detection** của Wazuh
+- Độ chính xác cao (confidence ≈ 0.999) trong thử nghiệm lab
 
 ---
 
-## 🎯 Tổng quan phương pháp
-
-### Quy trình tổng thể
-
-Hệ thống phát hiện tấn công Kerberos kết hợp Wazuh SIEM và mô hình XGBoost:
+## 🏗️ Quy trình tổng thể
 
 ```
-Thu thập log → Tiền xử lý → Trích xuất đặc trưng → Huấn luyện XGBoost
-→ Phát hiện real-time → Cảnh báo
+Log Wazuh (archives.json)
+        ↓
+   Trích xuất dữ liệu
+        ↓
+   Feature Engineering
+        ↓
+   Encoding dữ liệu
+        ↓
+   Model Prediction (XGBoost)
+        ↓
+   Phát hiện hành vi theo chuỗi sự kiện
+        ↓
+   Cảnh báo (Alert)
 ```
 
-**Ba loại sự kiện**:
-- **Normal**: Xác thực Kerberos hợp pháp
-- **Kerberoasting**: Tấn công yêu cầu nhiều service ticket (Event ID 4769 + RC4)
-- **AS-REP Roasting**: Tấn công khộng xác thực trước (Event ID 4768 + preAuthType=0)
+---
 
-### Dataset
+## 📊 Tiền xử lý dữ liệu
 
-- **Nguồn**: `kerberos_dataset.csv` (gộp 3 loại log từ Wazuh)
-- **Lớp**: 3 (Normal, Kerberoasting, AS-REP)
-- **Đặc trưng**: 12 feature (9 gốc + 3 engineered)
-- **Train/Test**: 80/20 stratified
+### Đầu vào
+Dữ liệu được đọc từ `kerberos_dataset.csv`, được xây dựng bằng cách gộp ba nhóm log:
 
-### Feature Engineering
+1. **Log bình thường (Normal)**
+   - Các hoạt động đăng nhập hợp lệ
+   - Event ID: 4624, 4625, 4768, 4769, 4770, 4771 (không có dấu hiệu tấn công)
+
+2. **Log Kerberoasting**
+   - Event ID 4769 (yêu cầu service ticket)
+   - Mã hóa RC4 (0x17)
+   - Các tài khoản dịch vụ (svc_*)
+
+3. **Log AS-REP Roasting**
+   - Event ID 4768 (cấp phát TGT)
+   - preAuthType = 0 (không yêu cầu pre-authentication)
+
+### Bước xử lý
 
 ```python
-# Raw features (9)
-eventID, targetUserName, serviceName, ticketEncryptionType, 
-ticketOptions, preAuthType, status, ipAddress, agent.name
+# 1. Thay thế giá trị thiếu
+df = df.fillna("unknown")
 
-# Engineered features (3)
-is_rc4 = (ticketEncryptionType == "0x17")          # RC4 detection
-is_no_preauth = (preAuthType == "0")               # Pre-auth disabled
-is_service_account = ("svc_" in serviceName)       # Service account
+# 2. Chuẩn hóa kiểu dữ liệu
+df["eventID"] = df["eventID"].astype(str)
+
+# 3. Các feature được sử dụng đã được chuẩn hóa
 ```
 
 ---
 
-## 🚀 Cài đặt
+## 🔧 Feature Engineering
 
-```bash
-# Yêu cầu
-python >= 3.8
+### Đặc trưng gốc (Raw Features)
+Được lấy trực tiếp từ log:
+- `eventID` - ID sự kiện Windows
+- `targetUserName` - Tên tài khoản đích
+- `serviceName` - Tên service
+- `ticketEncryptionType` - Loại mã hóa ticket
+- `ticketOptions` - Tùy chọn ticket
+- `preAuthType` - Loại pre-authentication
+- `status` - Trạng thái sự kiện
+- `ipAddress` - Địa chỉ IP nguồn
+- `agent.name` - Tên agent Wazuh
 
-# Cài đặt dependencies
-pip install -r requirements.txt
-```
-
-**Phụ thuộc**:
-- pandas==3.0.2 - Dữ liệu
-- scikit-learn==1.8.0 - LabelEncoder, metrics
-- xgboost==3.2.0 - Mô hình
-- joblib==1.5.3 - Tuần tự hóa
-
----
-
-## 📖 Sử dụng
-
-### 1. Huấn luyện mô hình
-
-```bash
-python train_xgboost_kerberos.py
-```
-
-**Quy trình**:
-1. Đọc `kerberos_dataset.csv`
-2. Xử lý: Fill NaN → chuẩn hóa kiểu dữ liệu
-3. Feature engineering: Tạo 3 đặc trưng nhị phân
-4. Label encoding: Mã hóa tất cả feature
-5. Train/Test split: 80/20 stratified
-6. Huấn luyện: XGBoost (n_estimators=150, max_depth=4)
-7. Đánh giá: Accuracy, Precision, Recall, F1-score
-8. Lưu: 3 file `.pkl`
-
-**Output**:
-```
-Dataset shape: (5000, 13)
-label
-    0    2000  (normal)
-    1    1500  (kerberoasting)
-    2    1500  (as-rep)
-
-Accuracy: 0.9950
-
-Classification Report:
-           precision  recall  f1-score  support
-normal        0.99     0.99     0.99      400
-kerberoasting 1.00     0.99     0.99      300
-as-rep        0.99     1.00     0.99      300
-
-Feature Importance:
-ticketEncryptionType   0.45
-preAuthType            0.30
-is_rc4                 0.12
-serviceName            0.08
-```
-
-**File được tạo**:
-- `xgboost_kerberos_model.pkl` ⭐
-- `label_encoders.pkl` ⭐
-- `features.pkl` ⭐
-
-### 2. Phát hiện real-time
-
-```bash
-python realtime_detect.py
-```
-
-**Yêu cầu**: 
-- Wazuh/OSSEC chạy trên Linux
-- File logs: `/var/ossec/logs/archives/archives.json`
-- Cả 3 file `.pkl` từ training
-
-**Quy trình**:
-1. Đọc live logs từ archives.json
-2. Trích xuất feature (extract_row)
-3. Encode bằng `label_encoders.pkl`
-4. Predict bằng `xgboost_kerberos_model.pkl`
-5. Nếu score > 0.5 → Sinh cảnh báo
-
-**Output (tấn công Kerberoasting)**:
-```
-[+] Realtime Kerberos ML Detector started...
-[+] Burst rule: >= 3 services within 60s
-
-============================================================
-[ALERT] KERBEROASTING | confidence=0.9991
-eventID: 4769
-user: user1@LAB.LOCAL
-service: svc_web
-encryption: 0x17
-preAuthType: 0
-ip: 192.168.1.100
-agent: win-domain-01
-
-[ALERT] KERBEROASTING | confidence=0.9989
-service: svc_sql
-
-[ALERT] KERBEROASTING | confidence=0.9988
-service: svc_file
-
-[HIGH] Kerberoasting burst detected: 3 different services requested within 60s
-```
-
----
-
-## 📁 Cấu trúc dự án
-
-```
-Machine Learning/
-├── train_xgboost_kerberos.py      # Huấn luyện mô hình
-├── realtime_detect.py             # Phát hiện real-time
-├── kerberos_dataset.csv           # Dữ liệu huấn luyện
-├── xgboost_kerberos_model.pkl     # Mô hình ⭐
-├── label_encoders.pkl             # LabelEncoders ⭐
-├── features.pkl                   # Feature list ⭐
-├── requirements.txt               # Dependencies
-├── .gitignore                     # Git rules
-└── README.md                      # File này
-```
-
-**⭐ Ghi chú**: File `.pkl` được tạo từ `train_xgboost_kerberos.py`
-
----
-
-## 🚨 Tính năng phát hiện
-
-### 1. Phát hiện từng log riêng lẻ
-
-Mô hình dự đoán **class** cho từng log:
-- **0 = Normal** (xác thực hợp pháp)
-- **1 = Kerberoasting** (request nhiều service tickets)
-- **2 = AS-REP Roasting** (pre-auth disabled)
-
-Output: Class + Confidence score
-
-### 2. Burst Detection (Phát hiện đột phát)
-
-Phát hiện Kerberoasting dựa trên **chuỗi sự kiện**:
-
-**Logic**:
-```
-Theo dõi (IP, User) → Event ID 4769
-Trong 60 giây: 
-  Nếu yêu cầu ≥ 3 service account khác nhau
-  → Cảnh báo HIGH (Kerberoasting burst)
-```
-
-**Ưu điểm**: Giảm false positive, phát hiện hành vi đặc trưng
-
----
-
-## 🔧 Tùy chỉnh
-
-### Điều chỉnh Burst Detection
-
-Trong `realtime_detect.py`:
+### Đặc trưng xây dựng thêm (Engineered Features)
+Ba đặc trưng nhị phân được tạo dựa trên kiến thức về tấn công:
 
 ```python
-WINDOW_SECONDS = 60      # Cửa sổ thời gian (giây)
-SERVICE_THRESHOLD = 3    # Ngưỡng service khác nhau
+# Phát hiện RC4 encryption (đặc trưng của Kerberoasting)
+is_rc4 = 1 if ticketEncryptionType == "0x17" else 0
+
+# Phát hiện tài khoản không yêu cầu pre-auth (đặc trưng của AS-REP)
+is_no_preauth = 1 if preAuthType == "0" else 0
+
+# Phát hiện service account (mục tiêu của Kerberoasting)
+is_service_account = 1 if "svc_" in serviceName.lower() else 0
 ```
 
-**Ví dụ**:
+### Encoding
+Tất cả dữ liệu categorical được chuyển đổi sang dạng số bằng **Label Encoding**:
+
 ```python
-WINDOW_SECONDS = 30      # Nhạy hơn (30s)
-SERVICE_THRESHOLD = 2    # Cảnh báo sớm hơn (2 service)
+from sklearn.preprocessing import LabelEncoder
+
+encoders = {}
+for col in X.columns:
+    le = LabelEncoder()
+    X[col] = le.fit_transform(X[col].astype(str))
+    encoders[col] = le  # Lưu để sử dụng lại khi predict
+
+# Lưu encoders để predict trên dữ liệu mới
+joblib.dump(encoders, "label_encoders.pkl")
 ```
 
-### Chỉnh siêu tham số mô hình
+---
 
-Trong `train_xgboost_kerberos.py`:
+## 🤖 Mô hình Machine Learning
+
+### Lựa chọn XGBoost
+
+**Lý do**:
+- ✅ Hiệu quả cao với dữ liệu dạng bảng (tabular data)
+- ✅ Xử lý tốt các feature categorical
+- ✅ Tốc độ huấn luyện nhanh
+- ✅ Cung cấp feature importance analysis
+- ✅ Hỗ trợ multi-class classification
+
+### Cấu hình mô hình
 
 ```python
 model = XGBClassifier(
-    n_estimators=150,       # Tăng = phức tạp hơn
-    max_depth=4,            # Tăng = nguy hiểm overfitting
-    learning_rate=0.1,      # Giảm = huấn luyện lâu hơn
-    objective="multi:softprob",
-    num_class=3,
-    eval_metric="mlogloss",
+    n_estimators=150,        # 150 cây quyết định
+    max_depth=4,             # Độ sâu tối đa
+    learning_rate=0.1,       # Tốc độ học
+    objective="multi:softprob",  # Multi-class classification
+    num_class=3,             # 3 lớp: normal, kerberoasting, asrep
+    eval_metric="mlogloss",  # Metric đánh giá
     random_state=42
 )
 ```
 
-⚠️ **Sau khi chỉnh**, cần re-train mô hình
+### Quy trình huấn luyện
+
+1. **Train/Test Split**: 80/20 với stratified sampling
+   ```python
+   X_train, X_test, y_train, y_test = train_test_split(
+       X, y,
+       test_size=0.2,
+       random_state=42,
+       stratify=y  # Giữ nguyên tỷ lệ các lớp
+   )
+   ```
+
+2. **Huấn luyện mô hình**
+   ```python
+   model.fit(X_train, y_train)
+   ```
+
+3. **Đánh giá**
+   ```python
+   from sklearn.metrics import classification_report, confusion_matrix
+   
+   y_pred = model.predict(X_test)
+   print(classification_report(y_test, y_pred))
+   print(confusion_matrix(y_test, y_pred))
+   ```
 
 ---
 
-## 📊 Đánh giá
+## 📦 Các tệp đầu ra
 
-### Chỉ số
+Sau khi huấn luyện, ba file được lưu để sử dụng trong giai đoạn phát hiện:
 
-Mô hình được đánh giá trên test set (20%):
-
-- **Accuracy**: Tỷ lệ dự đoán đúng
-- **Precision**: Cảnh báo đúng / Tất cả cảnh báo
-- **Recall**: Phát hiện được / Tất cả tấn công thực tế
-- **F1-score**: Cân bằng Precision-Recall
-- **Confusion Matrix**: TP, FP, TN, FN
-
-### Feature Importance
-
-Mô hình cung cấp xếp hạng feature:
-
-```
-ticketEncryptionType       0.45  (Loại mã hóa - quan trọng nhất)
-preAuthType                0.30  (Xác thực trước)
-is_rc4                     0.12  (Phát hiện RC4)
-serviceName                0.08  (Tên dịch vụ)
-targetUserName             0.03
-eventID                    0.02
-```
-
----
-
-## 📝 Ghi chú quan trọng
-
-### Thiết kế
-
-- **Loại trừ `is_attacker_ip`**: Tránh học cứng vào IP attacker
-- **LabelEncoder**: Lưu để phải dùng trong prediction
-- **Fill NaN**: Giá trị thiếu → `"unknown"`
-- **Stratified Split**: Giữ tỷ lệ lớp trong train/test
-
-### Tại sao archives.json?
-
-- **archives.json**: Raw logs (không lọc bởi rule)
-- **alerts.json**: Chỉ log thỏa rule (có thể bỏ sót)
-
-**Lợi ích**:
-✅ Mô hình độc lập với Wazuh rules
-✅ Phát hiện hành vi mới
-✅ Phát hiện tất cả tấn công
-
-### Hạn chế
-
-1. Dataset từ lab (ít nhiễu hơn thực tế)
-2. Một số feature quá rõ ràng (feature leakage)
-3. Dữ liệu đã lọc bởi Wazuh trước
-
-**Tuy nhiên** ✓ Dễ triển khai, độ chính xác cao (99%+)
-
----
-
-## 📄 Giấy phép
-
-Dự án riêng tư
-
-## 👤 Tác giả
-
-Nghiên cứu phát hiện tấn công Kerberos trên Active Directory
-
----
-
-## 🎯 Tổng quan phương pháp
-
-### Quy trình tổng thể
-
-Hệ thống phát hiện tấn công Kerberos được xây dựng dựa trên kết hợp giữa hệ thống SIEM (Wazuh) và mô hình học máy:
-
-```
-Thu thập log → Lọc log Kerberos → Tiền xử lý → Trích xuất đặc trưng 
-→ Huấn luyện mô hình → Phân loại → Cảnh báo
-```
-
-Dự án phát hiện ba loại sự kiện xác thực Kerberos:
-- **Normal**: Xác thực Kerberos hợp pháp
-- **Kerberoasting**: Tấn công nhắm vào các tài khoản dịch vụ
-- **AS-REP Roasting**: Tấn công vào người dùng vô hiệu hóa xác thực trước
-
----
-
-## 📊 Bộ dữ liệu
-
-### Nguồn dữ liệu
-
-- **Nền tảng**: Wazuh SIEM
-- **Loại log**: Windows Event logs
-- **Event IDs**: 4624, 4625, 4768, 4769, 4770, 4771
-
-### Cấu trúc dữ liệu
-
-Dataset được xây dựng bằng cách **gộp ba nhóm log riêng biệt**:
-
-| Loại | Nguồn | Điều kiện lọc | Số sự kiện |
-|------|-------|--------------|-----------|
-| **Normal** | Hoạt động đăng nhập hợp pháp | Event ID: 4624, 4625, 4768, 4769, 4770, 4771 (không có dấu hiệu tấn công) | normal_log.csv |
-| **Kerberoasting** | Yêu cầu service ticket | Event ID 4769 + ticketEncryptionType = 0x17 (RC4) + tài khoản dịch vụ (svc_*) | kerberoasting_log.csv |
-| **AS-REP Roasting** | Cấp phát TGT | Event ID 4768 + preAuthType = 0 (pre-auth disabled) | asrep_log.csv |
-
-**File dữ liệu chính**: `kerberos_dataset.csv` (gộp từ 3 nguồn trên)
-
-### Xử lý dữ liệu
-
-**Bước tiền xử lý**:
-
-1. **Xử lý giá trị thiếu**: Thay thế bằng `"unknown"`
-   - Không phải tất cả Event ID chứa đầy đủ các trường
-   - Ví dụ: Log Kerberoasting không có `preAuthType`, AS-REP không có `ticketOptions`
-
-2. **Chuẩn hóa kiểu dữ liệu**: 
-   - Chuyển `eventID` thành string
-   - Đảm bảo tất cả feature có định dạng phù hợp
-
-3. **Đảm bảo tính nhất quán**: Các giá trị rỗng/null đều được xử lý trước encoding
-
----
-
-## 📈 Trích xuất và xây dựng đặc trưng
-
-### 1. Đặc trưng gốc (Raw Features)
-
-Trực tiếp từ log Windows:
-
+### 1. `xgboost_kerberos_model.pkl`
+- **Nội dung**: Mô hình XGBoost đã huấn luyện
+- **Kích thước**: ~1-2 MB
+- **Sử dụng**: Dự đoán lớp của log mới
 ```python
-[
-    "eventID",                # Loại sự kiện (4768, 4769, ...)
-    "targetUserName",         # Tài khoản người dùng
-    "serviceName",            # Tên dịch vụ yêu cầu
-    "ticketEncryptionType",   # Loại mã hóa (0x17 = RC4)
-    "ticketOptions",          # Tùy chọn ticket
-    "preAuthType",            # Loại xác thực trước
-    "status",                 # Trạng thái sự kiện
-    "ipAddress",              # Địa chỉ IP nguồn
-    "agent.name"              # Tên agent Wazuh
-]
+model = joblib.load("xgboost_kerberos_model.pkl")
+prediction = model.predict(X_new)  # Trả về 0, 1, hoặc 2
+confidence = model.predict_proba(X_new)  # Trả về độ tin cậy
 ```
 
-### 2. Đặc trưng xây dựng thêm (Feature Engineering)
-
-Ba đặc trưng nhị phân được tạo từ logic tấn công:
-
+### 2. `label_encoders.pkl`
+- **Nội dung**: Dictionary chứa LabelEncoder cho từng feature
+- **Kích thước**: ~100 KB
+- **Sử dụng**: Encode dữ liệu categorical thành số khi predict
 ```python
-# Phát hiện RC4 - đặc trưng của Kerberoasting
-is_rc4 = 1 if ticketEncryptionType == "0x17" else 0
-
-# Phát hiện pre-auth disabled - đặc trưng của AS-REP Roasting
-is_no_preauth = 1 if preAuthType == "0" else 0
-
-# Phát hiện tài khoản dịch vụ - mục tiêu của Kerberoasting
-is_service_account = 1 if "svc_" in serviceName.lower() else 0
+encoders = joblib.load("label_encoders.pkl")
+# Dùng để encode các giá trị mới
+X_encoded[col] = encoders[col].transform(X[col])
 ```
 
-**Lợi ích**: Giúp mô hình học được các pattern quan trọng thay vì chỉ dựa vào dữ liệu thô.
-
-### 3. Mã hóa dữ liệu
-
-- **Phương pháp**: Label Encoding
-- **Mục đích**: Chuyển đổi các trường chuỗi sang dạng số nguyên phù hợp với XGBoost
-- **Lưu trữ**: Encoders được lưu trong `label_encoders.pkl` để sử dụng trong phát hiện real-time
-
----
-
-## 🔧 Lựa chọn mô hình
-
-### XGBoost Classifier
-
-**Lý do chọn**:
-
-| Tiêu chí | XGBoost |
-|----------|---------|
-| Hiệu quả với dữ liệu bảng | ✅ Rất cao |
-| Xử lý feature rời rạc | ✅ Xuất sắc |
-| Tốc độ huấn luyện | ✅ Nhanh |
-| Feature importance | ✅ Có |
-| Phân loại đa lớp | ✅ Hỗ trợ |
-
-### Siêu tham số
-
+### 3. `features.pkl`
+- **Nội dung**: Danh sách các feature được sử dụng
+- **Kích thước**: < 1 KB
+- **Sử dụng**: Đảm bảo dữ liệu predict có đúng thứ tự feature
 ```python
-model = XGBClassifier(
-    n_estimators=150,           # Số vòng boosting
-    max_depth=4,                # Độ sâu cây (tránh overfitting)
-    learning_rate=0.1,          # Tốc độ học
-    objective="multi:softprob", # Phân loại 3 lớp
-    num_class=3,                # Normal, Kerberoasting, AS-REP
-    eval_metric="mlogloss",     # Hàm đánh giá đa lớp
-    random_state=42             # Tái tạo kết quả
-)
+features = joblib.load("features.pkl")
+# features = ['eventID', 'targetUserName', 'serviceName', ...]
+X_new = df[features].copy()
 ```
 
 ---
 
-## 🚀 Quy trình huấn luyện
+## 🚀 Triển khai trên Ubuntu (Wazuh Manager)
 
-### Các bước
+### Yêu cầu hệ thống
+- Ubuntu Server (20.04 LTS trở lên)
+- Wazuh Manager đã được cài đặt
+- Python 3.8+
+- Các thư viện: pandas, scikit-learn, xgboost, joblib
 
-1. **Tải dữ liệu**: Đọc từ `kerberos_dataset.csv`
-2. **Tiền xử lý**: Fill NaN, chuẩn hóa kiểu dữ liệu
-3. **Feature Engineering**: Tạo 3 đặc trưng nhị phân
-4. **Chọn Feature**: Lọc 12 đặc trưng quan trọng nhất
-5. **Mã hóa**: Label Encode tất cả cột categorical
-6. **Chia dữ liệu**: Train 80% / Test 20% (với stratification)
-7. **Huấn luyện**: Fit XGBoost trên training set
-8. **Dự đoán**: Predict trên test set
-9. **Đánh giá**: Tính accuracy, precision, recall, F1-score
-10. **Lưu mô hình**: Pickle model + encoders + features
-
-### Cài đặt
+### Cài đặt dependencies
 
 ```bash
-python >= 3.8
 pip install -r requirements.txt
 ```
 
-### Huấn luyện mô hình
-
-```bash
-python train_xgboost_kerberos.py
+**requirements.txt**:
+```
+pandas==3.0.0
+scikit-learn==1.3.0
+xgboost==2.0.0
+joblib==1.5.3
 ```
 
-**Kết quả đầu ra**:
-- `xgboost_kerberos_model.pkl` - Mô hình đã huấn luyện
-- `label_encoders.pkl` - Bộ mã hóa đặc trưng (lưu từ LabelEncoder)
-- `features.pkl` - Danh sách 12 đặc trưng
+### Cấu trúc thư mục trên Ubuntu
+
+```
+/opt/wazuh/scripts/
+├── realtime_detect.py
+├── xgboost_kerberos_model.pkl
+├── label_encoders.pkl
+└── features.pkl
+```
+
+### Chạy script phát hiện
+
+#### 1. Chạy thủ công
+
+```bash
+cd /opt/wazuh/scripts/
+sudo python3 -E realtime_detect.py
+```
+
+Flag `-E` giữ nguyên các environment variables của user hiện tại khi chạy với sudo.
+
+#### 2. Chạy dưới dạng systemd service (tự động khởi động)
+
+Tạo file `/etc/systemd/system/wazuh-ml-detect.service`:
+
+```ini
+[Unit]
+Description=Wazuh ML Kerberos Attack Detection
+After=wazuh-manager.service
+Requires=wazuh-manager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wazuh/scripts/
+ExecStart=/usr/bin/sudo /usr/bin/python3 -E /opt/wazuh/scripts/realtime_detect.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Kích hoạt service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable wazuh-ml-detect
+sudo systemctl start wazuh-ml-detect
+sudo systemctl status wazuh-ml-detect
+```
+
+#### 3. Chạy dưới dạng background process
+
+```bash
+sudo python3 -E realtime_detect.py > detection.log 2>&1 &
+```
 
 ---
 
-## 📊 Đánh giá mô hình
+## 🔍 Chi tiết script realtime_detect.py
 
-### Chỉ số đánh giá
+### Chức năng chính
 
-Mô hình được đánh giá trên tập test 20%:
+Script này thực hiện hai loại phát hiện:
 
-- **Accuracy**: Tỷ lệ dự đoán đúng
-- **Precision**: Tỷ lệ cảnh báo đúng trong tất cả cảnh báo
-- **Recall**: Tỷ lệ phát hiện được tấn công trong tất cả tấn công
-- **F1-score**: Điểm cân bằng giữa precision và recall
-- **Confusion Matrix**: Hiển thị TP, FP, TN, FN cho từng lớp
-
-### Feature Importance
-
-Mô hình cung cấp xếp hạng các đặc trưng theo mức độ quan trọng:
-
-```bash
-Feature Importance:
-feature                       importance
-ticketEncryptionType         0.45
-preAuthType                  0.30
-is_rc4                       0.12
-serviceName                  0.08
-...
-```
-
----
-
-## 🚨 Phát hiện theo thời gian thực
-
-### 1. Kiểm tra mô hình
-
-```bash
-python test.py
-```
-
-Test trên 10 samples ngẫu nhiên từ `test_logs.csv`.
-
-**Output**:
-```
---- Log 0 ---
-Dự đoán: KERBEROASTING
-Confidence: 0.9991
-
---- Log 1 ---
-Dự đoán: NORMAL
-Confidence: 0.9998
-```
-
-### 2. Phát hiện live từ OSSEC/Wazuh
-
-```bash
-python realtime_detect.py
-```
-
-**Quy trình**:
-1. Đọc live logs từ `/var/ossec/logs/archives/archives.json`
-2. Trích xuất feature từ mỗi log mới
-3. Encode và predict bằng mô hình
-4. Nếu là tấn công → sinh cảnh báo
-
-### 3. Cơ chế Burst Detection
-
-**Mục đích**: Phát hiện Kerberoasting dựa trên chuỗi sự kiện
-
-**Logic**:
-- Theo dõi sự kiện Event ID 4769 theo (IP, User)
-- Nếu trong 60 giây, **≥ 3 service account khác nhau** được yêu cầu
-- → Sinh cảnh báo mức **HIGH** (Kerberoasting burst)
-
-**Tùy chỉnh**:
+#### 1. **Phát hiện từng sự kiện** (Per-Event Detection)
+- Đọc từng log từ `/var/ossec/logs/archives/archives.json`
+- Trích xuất dữ liệu theo cấu trúc của Wazuh
+- Encode features sử dụng label encoders
+- Dự đoán lớp (normal, kerberoasting, asrep)
+- Hiển thị kết quả nếu phát hiện tấn công
 
 ```python
-WINDOW_SECONDS = 60      # Cửa sổ thời gian (giây)
-SERVICE_THRESHOLD = 3    # Ngưỡng số service khác nhau
+def extract_row(log):
+    """Trích xuất dữ liệu từ log Wazuh"""
+    win = log.get("data", {}).get("win", {})
+    system = win.get("system", {})
+    eventdata = win.get("eventdata", {})
+    agent = log.get("agent", {})
+    
+    return {
+        "eventID": str(system.get("eventID", "unknown")),
+        "targetUserName": eventdata.get("targetUserName", "unknown"),
+        # ... các field khác
+    }
+
+def predict(row):
+    """Dự đoán lớp của log"""
+    # 1. Tạo DataFrame từ row
+    df = pd.DataFrame([row]).fillna("unknown")
+    
+    # 2. Feature engineering
+    df["is_rc4"] = ...
+    df["is_no_preauth"] = ...
+    df["is_service_account"] = ...
+    
+    # 3. Encoding
+    X = df[features].copy()
+    for col in X.columns:
+        if col in encoders:
+            X[col] = encoders[col].transform(X[col])
+    
+    # 4. Predict
+    pred = model.predict(X)[0]
+    conf = model.predict_proba(X)[0]
+    
+    return label_map[pred], conf[pred]
 ```
 
-**Ví dụ**:
-```
-[+] Realtime Kerberos ML Detector started...
-[+] Burst rule: >= 3 services within 60s
-
-[ALERT] KERBEROASTING | confidence=0.9991
-eventID: 4769
-user: user1@LAB.LOCAL
-service: svc_web
-...
-
-[HIGH] Kerberoasting burst detected: 3 different services requested within 60s
-service: [svc_web, svc_sql, svc_file]
-```
-
----
-
-## 📁 Cấu trúc dự án
-
-```
-├── train_xgboost_kerberos.py    # Script huấn luyện mô hình
-├── test.py                       # Kiểm tra mô hình
-├── realtime_detect.py            # Giám sát nhật ký theo thời gian thực
-├── kerberos_dataset.csv          # Dữ liệu huấn luyện (gộp từ 3 nguồn)
-├── normal_log.csv                # Nhật ký bình thường
-├── kerberoasting_log.csv         # Nhật ký Kerberoasting
-├── asrep_log.csv                 # Nhật ký AS-REP Roasting
-├── test_logs.csv                 # Dữ liệu kiểm tra
-├── requirements.txt              # Python dependencies
-├── .gitignore                    # Quy tắc bỏ qua Git
-└── README.md                     # File này
-```
-
-**Ghi chú**: 
-- Tất cả file CSV được lưu trữ trong repository
-- Chỉ file mô hình `.pkl` được bỏ qua bởi `.gitignore`
-
----
-
-## 🛠️ Tùy chỉnh
-
-### Điều chỉnh ngưỡng phát hiện đột phát
-
-Trong `realtime_detect.py`:
+#### 2. **Phát hiện hành vi theo chuỗi sự kiện** (Behavioral Detection)
+- Theo dõi các sự kiện 4769 (request service ticket) theo IP và user
+- Đếm số service account khác nhau được request trong 60 giây
+- Nếu số service ≥ 3 → Cảnh báo Kerberoasting burst
 
 ```python
-WINDOW_SECONDS = 60      # Cửa sổ thời gian (giây)
-SERVICE_THRESHOLD = 3    # Số dịch vụ để kích hoạt cảnh báo
+def check_kerberoast_burst(row):
+    """Phát hiện burst Kerberoasting"""
+    if row["eventID"] != "4769":
+        return False, 0
+    
+    now = time.time()
+    key = (row["ipAddress"], row["targetUserName"])
+    
+    # Lưu thời gian và service vào window
+    kerberoast_window[key].append((now, row["serviceName"]))
+    
+    # Xóa log cũ ngoài 60 giây
+    while kerberoast_window[key] and now - kerberoast_window[key][0][0] > 60:
+        kerberoast_window[key].popleft()
+    
+    # Đếm số service khác nhau
+    unique_services = set(service for _, service in kerberoast_window[key])
+    
+    # Nếu ≥ 3 service trong 60 giây → Alert
+    if len(unique_services) >= 3:
+        return True, len(unique_services)
+    
+    return False, len(unique_services)
 ```
 
-### Chỉnh sửa siêu tham số mô hình
-
-Trong `train_xgboost_kerberos.py`:
-
-```python
-model = XGBClassifier(
-    n_estimators=150,       # Số vòng boosting (tăng = mô hình phức tạp hơn)
-    max_depth=4,            # Độ sâu cây (tăng = có thể overfitting)
-    learning_rate=0.1,      # Tốc độ học (giảm = huấn luyện lâu hơn nhưng chính xác hơn)
-)
-```
-
----
-
-## 📝 Ghi chú quan trọng
-
-### Thiết kế mô hình
-
-- **Loại trừ `is_attacker_ip`**: Tránh mô hình học cứng vào một số IP attacker cụ thể
-- **LabelEncoder**: Tất cả feature categorical được mã hóa, lưu để dùng lại
-- **Xử lý NaN**: Giá trị thiếu được điền `"unknown"` để tránh lỗi encoding
-- **Stratified Split**: Train/Test 80/20 với phân tầng để đảm bảo tỷ lệ lớp
-
-### Sử dụng archives.json (không alerts.json)
-
-**Tại sao**?
-
-- **archives.json**: Chứa tất cả raw logs, không bị lọc bởi rule-based detection
-- **alerts.json**: Chỉ chứa log đã thỏa mãn rule (có thể bỏ sót hành vi mới)
-
-Sử dụng archives.json giúp:
-- Mô hình độc lập với Wazuh rules
-- Phát hiện cả hành vi bình thường và tấn công
-- Phát hiện các tấn công chưa định nghĩa trong rule
-
----
-
-## ⚠️ Thảo luận và hạn chế
-
-### Hạn chế hiện tại
-
-1. **Dữ liệu lab**: Dataset được xây dựng trong môi trường lab, ít nhiễu hơn thực tế
-2. **Feature rõ ràng**: Một số feature như `eventID`, `ticketEncryptionType` có khả năng phân tách lớp rất mạnh
-3. **Feature leakage**: Mô hình có thể học theo rule thay vì hành vi phức tạp
-4. **Dữ liệu lọc trước**: Dataset đã được lọc bởi Wazuh trước tiền xử lý
-
-### Lý do vẫn hợp lý
-
-✅ Dễ triển khai và kiểm soát
-✅ Minh họa rõ ràng cơ chế phát hiện
-✅ Phù hợp với mục tiêu nghiên cứu
-✅ Kết quả phát hiện đạt độ chính xác cao trên test set
-
----
-
-## 📊 Demo kết quả
-
-### AS-REP Roasting Detection
-
-Khi thực hiện tấn công AS-REP Roasting:
+### Luồng xử lý log
 
 ```
-[ALERT] AS-REP ROASTING | confidence=0.9996
-eventID: 4768
-user: victim_user@LAB.LOCAL
-encryption: 0x17
-preAuthType: 0
-ip: 192.168.1.100
-agent: win-server-01
+Đọc log từ archives.json
+        ↓
+extract_row() → Trích xuất dữ liệu
+        ↓
+check_kerberoast_burst() → Phát hiện burst (nếu là event 4769)
+        ↓
+predict() → Phân loại bằng model
+        ↓
+Nếu attack → In cảnh báo
+        ↓
+Tiếp tục đọc log tiếp theo
 ```
 
-### Kerberoasting Burst Detection
-
-Khi thực hiện tấn công Kerberoasting:
+### Output khi phát hiện tấn công
 
 ```
-[ALERT] KERBEROASTING | confidence=0.9991
-eventID: 4769
-user: user1@LAB.LOCAL
-service: svc_web
+[ALERT] AS-REP Roasting Detection
+Event ID: 4768
+User: user1@LAB.LOCAL
+Service: krbtgt
+IP: 192.168.1.100
+Prediction: asrep | Confidence: 0.9996
 
-[ALERT] KERBEROASTING | confidence=0.9989
-service: svc_sql
-
-[ALERT] KERBEROASTING | confidence=0.9988
-service: svc_file
-
-[HIGH] Kerberoasting burst detected: 3 different services within 60s
+[ALERT] Kerberoasting Burst Detection
+IP/User: 192.168.1.100 / user1@LAB.LOCAL
+Services requested: 3 (svc_web, svc_sql, svc_file)
+Time window: 60 seconds
+Severity: HIGH
 ```
 
 ---
 
-## 🔗 Các phụ thuộc
+## 📈 Kết quả thử nghiệm
 
-| Package | Phiên bản | Mục đích |
-|---------|-----------|---------|
-| pandas | 3.0.2 | Thao tác và phân tích dữ liệu |
-| scikit-learn | 1.8.0 | LabelEncoder, metrics, preprocessing |
-| xgboost | 3.2.0 | Mô hình Gradient Boosting Classifier |
-| joblib | 1.5.3 | Tuần tự hóa model, encoders, features |
+### Phát hiện AS-REP Roasting
+- **Event ID**: 4768
+- **Độ tin cậy**: ≈ 0.9996
+- **Thời gian phát hiện**: Gần thời gian thực (< 1 giây)
+
+### Phát hiện Kerberoasting
+- **Event ID**: 4769
+- **Độ tin cậy**: ≈ 0.9991
+- **Phát hiện hành vi Kerberoasting burst**:
+  - Nếu cùng 1 user/IP request > 3 service trong 60 giây
+  - Severity: HIGH
+  - Đầy đủ thông tin user, service, IP, thời gian
 
 ---
 
-## 📄 Giấy phép
+## ⚠️ Hạn chế và ghi chú
 
-Dự án riêng tư
+### Hạn chế của dataset lab
 
-## 👤 Tác giả
+1. **Ít nhiễu hơn thực tế**
+   - Dataset được xây dựng từ môi trường lab
+   - Dữ liệu đã được pre-filter bởi Wazuh
+   - Các edge case hiếm gặp có thể không được cover
 
-Được tạo cho nghiên cứu phát hiện tấn công Kerberos trong Active Directory
+2. **Feature leakage**
+   - Một số features (eventID, ticketEncryptionType, preAuthType) có khả năng phân tách lớp rất mạnh
+   - Mô hình có thể học theo pattern cụ thể thay vì hành vi phức tạp
+   - Có thể cần điều chỉnh khi triển khai trên môi trường thực
+
+3. **Phụ thuộc vào cấu trúc log**
+   - Một số field có thể không tồn tại trong tất cả event
+   - Script xử lý bằng cách thay thế `unknown`
+   - Có thể cần điều chỉnh nếu cấu trúc log thay đổi
+
+### Khuyến nghị
+
+- **Tái huấn luyện định kỳ**: Khi thu thập dữ liệu thực từ sản xuất
+- **Điều chỉnh threshold**: Thay đổi SERVICE_THRESHOLD từ 3 tùy theo chiến lược
+- **Giám sát**: Theo dõi false positive/negative để cải thiện mô hình
+- **Cập nhật**: Xem xét các tấn công Kerberos mới có thể xảy ra
