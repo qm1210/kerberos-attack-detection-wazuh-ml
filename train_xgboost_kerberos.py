@@ -5,22 +5,16 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from xgboost import XGBClassifier
 import joblib
 
-# =========================
 # 1. Load dataset
-# =========================
 df = pd.read_csv("kerberos_dataset.csv")
 
 print("Dataset shape:", df.shape)
 print(df["label"].value_counts())
 
-# =========================
 # 2. Fill missing values
-# =========================
 df = df.fillna("unknown")
 
-# =========================
 # 3. Feature engineering
-# =========================
 df["eventID"] = df["eventID"].astype(str)
 
 df["is_rc4"] = df["ticketEncryptionType"].apply(
@@ -35,10 +29,7 @@ df["is_service_account"] = df["serviceName"].apply(
     lambda x: 1 if "svc_" in str(x).lower() else 0
 )
 
-# =========================
 # 4. Chọn feature
-# Bỏ is_attacker_ip để tránh model học cứng IP attacker
-# =========================
 features = [
     "eventID",
     "targetUserName",
@@ -57,9 +48,7 @@ features = [
 X = df[features].copy()
 y = df["label"].astype(int)
 
-# =========================
 # 5. Encode categorical columns
-# =========================
 encoders = {}
 
 for col in X.columns:
@@ -73,9 +62,7 @@ X = X.astype(int)
 print("\nData types after encoding:")
 print(X.dtypes)
 
-# =========================
 # 6. Train/test split
-# =========================
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
@@ -84,9 +71,7 @@ X_train, X_test, y_train, y_test = train_test_split(
     stratify=y
 )
 
-# =========================
 # 7. Train XGBoost
-# =========================
 model = XGBClassifier(
     n_estimators=150,
     max_depth=4,
@@ -99,9 +84,7 @@ model = XGBClassifier(
 
 model.fit(X_train, y_train)
 
-# =========================
 # 8. Evaluate
-# =========================
 y_pred = model.predict(X_test)
 y_proba = model.predict_proba(X_test)
 
@@ -117,9 +100,7 @@ print(classification_report(
 print("\nConfusion Matrix:")
 print(confusion_matrix(y_test, y_pred))
 
-# =========================
 # 9. Feature importance
-# =========================
 importance = pd.DataFrame({
     "feature": X.columns,
     "importance": model.feature_importances_
@@ -128,9 +109,7 @@ importance = pd.DataFrame({
 print("\nFeature Importance:")
 print(importance)
 
-# =========================
 # 10. Save model
-# =========================
 joblib.dump(model, "xgboost_kerberos_model.pkl")
 joblib.dump(encoders, "label_encoders.pkl")
 joblib.dump(features, "features.pkl")
